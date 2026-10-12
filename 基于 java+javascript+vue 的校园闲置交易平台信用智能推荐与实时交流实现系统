@@ -1,0 +1,652 @@
+架构图
+
+┌─────────────────────────────────────────────────────────────┐
+│                      客户端 (浏览器)                          │
+│         Vue 3 + Vite + Element Plus + Pinia + Axios          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ HTTPS / WebSocket
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Nginx (反向代理 + gzip + 静态资源)               │
+│      80/443 → 前端静态资源；/api → 8080；/ws → 8081          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Spring Boot │  │  WebSocket   │  │  推荐服务     │
+│  REST API    │  │  (Netty/WS)  │  │  (信用算法)   │
+│  :8080       │  │   :8081      │  │  内嵌模块     │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └────────┬────────┴────────┬────────┘
+                ▼                 ▼
+        ┌──────────────┐  ┌──────────────┐
+        │    MySQL     │  │    Redis     │
+        │  (8 张核心表) │  │ 缓存/排行榜/锁│
+        └──────────────┘  └──────────────┘ 
+
+  项目结构
+  campus-trade/
+├── src/main/java/com/campus/trade/
+│   ├── CampusTradeApplication.java
+│   ├── config/
+│   │   ├── RedisConfig.java          # Redis 序列化/缓存管理器
+│   │   ├── WebSocketConfig.java      # STOMP 端点
+│   │   ├── SecurityConfig.java       # JWT + 角色权限
+│   │   └── WebMvcConfig.java         # 跨域/静态资源
+│   ├── controller/
+│   │   ├── AuthController.java
+│   │   ├── GoodsController.java
+│   │   ├── OrderController.java
+│   │   ├── ChatController.java
+│   │   ├── RecommendController.java
+│   │   └── DashboardController.java
+│   ├── service/impl/
+│   │   ├── GoodsServiceImpl.java
+│   │   ├── CreditServiceImpl.java    # 信用分计算
+│   │   ├── RecommendServiceImpl.java # 智能推荐
+│   │   └── ChatServiceImpl.java
+│   ├── mapper/                       # MyBatis-Plus
+│   ├── entity/  dto/  vo/
+│   └── common/                       # 统一响应/异常/工具
+└── resources/
+    ├── application.yml
+    └── mapper/*.xml
+  
+  数据库
+  -- 1. 用户表（学生/管理员）
+CREATE TABLE `user` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `student_no` VARCHAR(20) UNIQUE NOT NULL,
+  `username` VARCHAR(50) NOT NULL,
+  `password` VARCHAR(100) NOT NULL COMMENT 'BCrypt',
+  `avatar` VARCHAR(255),
+  `role` TINYINT DEFAULT 0 COMMENT '0学生 1教师 2管理员',
+  `credit_score` INT DEFAULT 100 COMMENT '信用分 0-150',
+  `college` VARCHAR(50),
+  `major` VARCHAR(50),
+  `grade` VARCHAR(10),
+  `phone` VARCHAR(20),
+  `status` TINYINT DEFAULT 1,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_student_no (`student_no`),
+  INDEX idx_credit (`credit_score`)
+) ENGINE=InnoDB;
+
+-- 2. 商品表
+CREATE TABLE `goods` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `seller_id` BIGINT NOT NULL,
+  `title` VARCHAR(100) NOT NULL,
+  `description` TEXT,
+  `price` DECIMAL(10,2) NOT NULL,
+  `original_price` DECIMAL(10,2),
+  `category_id` INT NOT NULL,
+  `cover_img` VARCHAR(255),
+  `images` JSON,
+  `condition_level` TINYINT COMMENT '1-10成新',
+  `status` TINYINT DEFAULT 0 COMMENT '0在售 1已售 2下架',
+  `view_count` INT DEFAULT 0,
+  `favorite_count` INT DEFAULT 0,
+  `location` VARCHAR(100),
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`seller_id`) REFERENCES `user`(`id`),
+  INDEX idx_category (`category_id`, `status`),
+  INDEX idx_seller (`seller_id`),
+  FULLTEXT idx_title_desc (`title`, `description`)
+) ENGINE=InnoDB;
+
+-- 3. 分类表
+CREATE TABLE `category` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT,
+  `name` VARCHAR(30) NOT NULL,
+  `icon` VARCHAR(100),
+  `parent_id` INT DEFAULT 0,
+  `sort` INT DEFAULT 0
+) ENGINE=InnoDB;
+
+-- 4. 订单表
+CREATE TABLE `order` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `order_no` VARCHAR(32) UNIQUE NOT NULL,
+  `goods_id` BIGINT NOT NULL,
+  `buyer_id` BIGINT NOT NULL,
+  `seller_id` BIGINT NOT NULL,
+  `amount` DECIMAL(10,2) NOT NULL,
+  `status` TINYINT DEFAULT 0 COMMENT '0待确认 1交易中 2完成 3取消 4纠纷',
+  `trade_type` TINYINT COMMENT '0面交 1快递',
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `finished_at` DATETIME,
+  FOREIGN KEY (`goods_id`) REFERENCES `goods`(`id`),
+  INDEX idx_buyer (`buyer_id`),
+  INDEX idx_seller (`seller_id`)
+) ENGINE=InnoDB;
+
+-- 5. 评价表（信用核心）
+CREATE TABLE `review` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `order_id` BIGINT NOT NULL,
+  `reviewer_id` BIGINT NOT NULL,
+  `reviewee_id` BIGINT NOT NULL,
+  `score` TINYINT NOT NULL COMMENT '1-5星',
+  `content` VARCHAR(500),
+  `tags` JSON COMMENT '标签: 描述相符/发货快/态度好',
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`order_id`) REFERENCES `order`(`id`),
+  INDEX idx_reviewee (`reviewee_id`)
+) ENGINE=InnoDB;
+
+-- 6. 聊天消息表
+CREATE TABLE `chat_message` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `from_id` BIGINT NOT NULL,
+  `to_id` BIGINT NOT NULL,
+  `content` TEXT NOT NULL,
+  `msg_type` TINYINT DEFAULT 0 COMMENT '0文本 1图片 2商品卡片',
+  `is_read` TINYINT DEFAULT 0,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_session (`from_id`, `to_id`, `created_at`),
+  INDEX idx_to_unread (`to_id`, `is_read`)
+) ENGINE=InnoDB;
+
+-- 7. 收藏表
+CREATE TABLE `favorite` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `user_id` BIGINT NOT NULL,
+  `goods_id` BIGINT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_user_goods (`user_id`, `goods_id`)
+) ENGINE=InnoDB;
+
+-- 8. 信用流水表
+CREATE TABLE `credit_log` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT,
+  `user_id` BIGINT NOT NULL,
+  `change_score` INT NOT NULL,
+  `reason` VARCHAR(100),
+  `ref_id` BIGINT COMMENT '关联订单/评价ID',
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_user (`user_id`, `created_at`)
+) ENGINE=InnoDB;
+
+代码
+@Service
+public class CreditServiceImpl {
+
+    /** 信用分基线：100 分，范围 0-150 */
+    private static final int BASE_SCORE = 100;
+
+    /**
+     * 信用分 = 基础分 + 交易完成率*20 + 平均评分因子*20
+     *          + 活跃度*10 - 违约/纠纷扣分
+     */
+    public int calculateCredit(Long userId) {
+        UserStat stat = orderMapper.selectUserStat(userId);
+        double finishRate = stat.getTotalOrders() == 0 ? 1.0
+                : (double) stat.getFinishedOrders() / stat.getTotalOrders();
+        double avgScore = reviewMapper.selectAvgScore(userId);      // 1~5
+        double activeScore = Math.min(stat.getLast30dOrders() / 5.0, 1.0);
+
+        double score = BASE_SCORE
+                + finishRate * 20
+                + (avgScore - 3) * 10          // 3星为中性
+                + activeScore * 10
+                - stat.getDisputeCount() * 5
+                - stat.getCancelCount() * 2;
+
+        return (int) Math.max(0, Math.min(150, Math.round(score)));
+    }
+
+    /** 信用变更 + 流水 */
+    @Transactional
+    public void changeCredit(Long userId, int delta, String reason, Long refId) {
+        userMapper.updateCredit(userId, delta);
+        creditLogMapper.insert(new CreditLog(userId, delta, reason, refId));
+        // 信用分变化 → 删除缓存
+        redisTemplate.delete("user:credit:" + userId);
+        // 同步 ZSet 排行榜
+        redisTemplate.opsForZSet().add("rank:credit", userId.toString(),
+                userMapper.selectById(userId).getCreditScore());
+    }
+
+    /** 缓存的信用查询（防穿透/击穿/雪崩） */
+    public int getCreditWithCache(Long userId) {
+        String key = "user:credit:" + userId;
+        Object cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) return (int) cached;
+
+        // 互斥锁防击穿
+        String lockKey = "lock:credit:" + userId;
+        Boolean locked = redisTemplate.opsForValue()
+                .setIfAbsent(lockKey, "1", 3, TimeUnit.SECONDS);
+
+        if (Boolean.TRUE.equals(locked)) {
+            try {
+                User user = userMapper.selectById(userId);
+                int score = user == null ? -1 : user.getCreditScore();
+                // 空值短 TTL 防穿透 + 随机偏移防雪崩
+                long ttl = user == null ? 60
+                        : 300 + ThreadLocalRandom.current().nextInt(-60, 61);
+                redisTemplate.opsForValue().set(key, score, ttl, TimeUnit.SECONDS);
+                return score;
+            } finally {
+                redisTemplate.delete(lockKey);
+            }
+        } else {
+            // 未抢到锁：短暂休眠后重试
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return getCreditWithCache(userId);
+        }
+    }
+}
+@Service
+public class RecommendServiceImpl {
+
+    /**
+     * 推荐打分 = 0.4*信用匹配 + 0.3*类目兴趣 + 0.2*价格适配 + 0.1*热度
+     */
+    public List<GoodsVO> recommendForUser(Long userId, int page, int size) {
+        String cacheKey = "rec:user:" + userId + ":" + page;
+        List<GoodsVO> cached = (List<GoodsVO>) redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null) return cached;
+
+        // 1. 用户画像：近30天浏览/收藏的类目分布
+        Map<Integer, Double> interest = buildInterestProfile(userId);
+        User user = userMapper.selectById(userId);
+        int myCredit = user.getCreditScore();
+
+        // 2. 候选集：在售商品（限制500条避免全表扫描）
+        List<Goods> candidates = goodsMapper.selectOnSaleLimit(500);
+
+        // 3. 打分
+        List<ScoredGoods> scored = candidates.stream().map(g -> {
+            int sellerCredit = getCreditWithCache(g.getSellerId());
+            double creditMatch = 1 - Math.abs(myCredit - sellerCredit) / 150.0;
+            double categoryMatch = interest.getOrDefault(g.getCategoryId(), 0.0);
+            double priceFit = priceFitScore(userId, g.getPrice());
+            double hotness = Math.min(g.getViewCount() / 100.0, 1.0);
+
+            double score = 0.4 * creditMatch + 0.3 * categoryMatch
+                         + 0.2 * priceFit + 0.1 * hotness;
+            return new ScoredGoods(g, score);
+        }).sorted(Comparator.comparingDouble(ScoredGoods::getScore).reversed())
+          .limit(200)
+          .map(ScoredGoods::toVO)
+          .collect(Collectors.toList());
+
+        // 分页切片 + 缓存（随机 TTL 防雪崩）
+        List<GoodsVO> result = paginate(scored, page, size);
+        redisTemplate.opsForValue().set(cacheKey, result,
+                180 + ThreadLocalRandom.current().nextInt(60), TimeUnit.SECONDS);
+        return result;
+    }
+
+    /** 用 Redis ZSet 记录用户对类目的兴趣权重 */
+    private Map<Integer, Double> buildInterestProfile(Long userId) {
+        Set<ZSetOperations.TypedTuple<String>> tuples = redisTemplate.opsForZSet()
+                .reverseRangeWithScores("user:interest:" + userId, 0, 9);
+        if (tuples == null || tuples.isEmpty()) return Collections.emptyMap();
+        double max = tuples.stream().mapToDouble(ZSetOperations.TypedTuple::getScore).max().orElse(1);
+        return tuples.stream().collect(Collectors.toMap(
+                t -> Integer.parseInt(t.getValue()),
+                t -> t.getScore() / max));
+    }
+
+    /** 用户浏览/收藏时打点 */
+    public void onUserAction(Long userId, int categoryId, double weight) {
+        redisTemplate.opsForZSet().incrementScore(
+                "user:interest:" + userId, String.valueOf(categoryId), weight);
+        redisTemplate.expire("user:interest:" + userId, 30, TimeUnit.DAYS);
+        // 清推荐缓存
+        redisTemplate.delete(redisTemplate.keys("rec:user:" + userId + ":*"));
+    }
+}
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("*")
+                .withSockJS();
+    }
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/queue", "/topic");
+        registry.setUserDestinationPrefix("/user");
+        registry.setApplicationDestinationPrefixes("/app");
+    }
+}
+
+@Controller    //WebSocket 实时聊天
+public class ChatController {
+
+    @Autowired private SimpMessagingTemplate messagingTemplate;
+    @Autowired private ChatMessageMapper chatMapper;
+    @Autowired private CreditService creditService;
+
+    /** 客户端发送到 /app/chat.send → 推送给对方 /user/{id}/queue/messages */
+    @MessageMapping("/chat.send")
+    public void send(@Payload ChatMessage msg, Principal principal) {
+        Long fromId = Long.parseLong(principal.getName());
+        msg.setFromId(fromId);
+        msg.setCreatedAt(LocalDateTime.now());
+        chatMapper.insert(msg);
+
+        // 推送给接收者（在线即收，离线存库）
+        messagingTemplate.convertAndSendToUser(
+                msg.getToId().toString(), "/queue/messages", msg);
+        // 回执给发送者（确认送达）
+        messagingTemplate.convertAndSendToUser(
+                fromId.toString(), "/queue/ack", msg.getId());
+    }
+
+    /** 商品详情页 → 一键聊卖家，带商品卡片上下文 */
+    @MessageMapping("/chat.goods")
+    public void chatAboutGoods(@Payload GoodsCardMsg msg, Principal principal) {
+        Long fromId = Long.parseLong(principal.getName());
+        Goods goods = goodsMapper.selectById(msg.getGoodsId());
+        // 交易意向建立 → 提升类目兴趣权重
+        recommendService.onUserAction(fromId, goods.getCategoryId(), 1.5);
+        // 通知卖家有新的商品咨询
+        messagingTemplate.convertAndSendToUser(
+                goods.getSellerId().toString(), "/queue/notify",
+                new NotifyVO("GOODS_INQUIRY", "有人咨询你的商品：" + goods.getTitle()));
+    }
+}
+@Transactional
+public void finishOrder(Long orderId, Long operatorId) {
+    Order order = orderMapper.selectById(orderId);
+    order.setStatus(2);
+    order.setFinishedAt(LocalDateTime.now());
+    orderMapper.updateById(order);
+
+    // 双方信用分 +3（按时完成）
+    creditService.changeCredit(order.getBuyerId(), 3, "交易完成", orderId);
+    creditService.changeCredit(order.getSellerId(), 3, "交易完成", orderId);
+
+    // 更新 Redis ZSet 交易榜
+    redisTemplate.opsForZSet().incrementScore(
+            "rank:trader", order.getSellerId().toString(), 1);
+
+    // WebSocket 推送双方
+    messagingTemplate.convertAndSendToUser(
+            order.getBuyerId().toString(), "/queue/notify",
+            new NotifyVO("ORDER_DONE", "订单已完成，请评价对方"));
+}
+// utils/ws.js
+import SockJS from 'sockjs-client'
+import { Client } from '@stomp/stompjs'
+import { useChatStore } from '@/stores/chat'
+
+let client = null
+
+export function connectWS(token) {
+  const chatStore = useChatStore()
+  client = new Client({
+    webSocketFactory: () => new SockJS('/ws?token=' + token),
+    reconnectDelay: 5000,
+    onConnect: () => {
+      client.subscribe('/user/queue/messages', (frame) => {
+        const msg = JSON.parse(frame.body)
+        chatStore.receiveMessage(msg)
+        ElNotification({ title: '新消息', message: msg.content })
+      })
+      client.subscribe('/user/queue/notify', (frame) => {
+        const notify = JSON.parse(frame.body)
+        ElNotification({ title: '通知', message: notify.content })
+      })
+    }
+  })
+  client.activate()
+}
+
+export function sendMessage(toId, content, msgType = 0) {
+  client.publish({
+    destination: '/app/chat.send',
+    body: JSON.stringify({ toId, content, msgType })
+  })
+}
+
+export function disconnectWS() { client?.deactivate() }
+  <template>
+  <div class="home">
+    <!-- 顶部信用徽章 -->
+    <CreditBadge :score="userStore.credit" />
+
+    <!-- 推荐流 -->
+    <div class="goods-grid">
+      <GoodsCard v-for="g in recommendList" :key="g.id" :goods="g"
+                 @click="goDetail(g.id)" />
+    </div>
+
+    <el-skeleton v-if="loading" :rows="6" />
+    <el-empty v-if="!loading && !recommendList.length" description="暂无推荐" />
+
+    <!-- 无限滚动 -->
+    <div ref="loadMore" v-intersect="loadMoreHandler"></div>
+  </div>
+</template>
+
+  vue
+  
+<script setup>
+import { ref, onMounted } from 'vue'
+import { useUserStore } from '@/stores/user'
+import { getRecommend } from '@/api/recommend'
+
+const userStore = useUserStore()
+const recommendList = ref([])
+const page = ref(1)
+const loading = ref(false)
+const finished = ref(false)
+
+async function loadMore() {
+  if (loading.value || finished.value) return
+  loading.value = true
+  const res = await getRecommend({ page: page.value, size: 20 })
+  if (!res.data.length) finished.value = true
+  recommendList.value.push(...res.data)
+  page.value++
+  loading.value = false
+}
+
+onMounted(loadMore)
+</script>
+  <template>
+  <div class="chat-window">
+    <div class="header">
+      <el-avatar :src="peer.avatar" />
+      <span>{{ peer.username }}</span>
+      <CreditBadge :score="peer.credit" size="small" />
+      <el-tag v-if="peer.online" type="success">在线</el-tag>
+    </div>
+
+    <div class="messages" ref="msgBox">
+      <div v-for="m in messages" :key="m.id"
+           :class="['msg', m.fromId === userStore.id ? 'mine' : 'peer']">
+        <div class="bubble">{{ m.content }}</div>
+        <div class="time">{{ formatTime(m.createdAt) }}</div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <el-input v-model="text" @keyup.enter="send"
+                placeholder="输入消息，回车发送" />
+      <el-button type="primary" @click="send">发送</el-button>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, watch, nextTick } from 'vue'
+import { sendMessage } from '@/utils/ws'
+import { useChatStore } from '@/stores/chat'
+
+const chatStore = useChatStore()
+const text = ref('')
+const msgBox = ref()
+
+const messages = computed(() => chatStore.currentMessages)
+
+function send() {
+  if (!text.value.trim()) return
+  sendMessage(chatStore.currentPeerId, text.value)
+  text.value = ''
+}
+
+watch(messages, () => nextTick(() => {
+  msgBox.value.scrollTop = msgBox.value.scrollHeight
+}), { deep: true })
+</script>
+  <template>
+  <div class="dashboard">
+    <el-row :gutter="20">
+      <el-col :span="8"><div ref="radarRef" class="chart" /></el-col>
+      <el-col :span="8"><div ref="trendRef" class="chart" /></el-col>
+      <el-col :span="8"><div ref="rankRef"  class="chart" /></el-col>
+    </el-row>
+  </div>
+</template>
+
+<script setup>
+import * as echarts from 'echarts'
+import { onMounted, ref } from 'vue'
+import { getCreditRadar, getCreditTrend, getTraderRank } from '@/api/dashboard'
+
+const radarRef = ref(); const trendRef = ref(); const rankRef = ref()
+
+onMounted(async () => {
+  // 信用雷达
+  const radarData = await getCreditRadar()
+  echarts.init(radarRef.value).setOption({
+    title: { text: '信用画像' },
+    radar: { indicator: [
+      { name: '交易完成率', max: 100 }, { name: '好评率', max: 100 },
+      { name: '活跃度', max: 100 },     { name: '响应速度', max: 100 },
+      { name: '纠纷率', max: 100 }
+    ]},
+    series: [{ type: 'radar', data: [{ value: radarData.data, name: '我的信用' }] }]
+  })
+
+  // 信用趋势（折线）
+  const trend = await getCreditTrend()
+  echarts.init(trendRef.value).setOption({
+    title: { text: '信用分趋势（近30天）' },
+    xAxis: { type: 'category', data: trend.data.dates },
+    yAxis: { type: 'value', min: 0, max: 150 },
+    series: [{ type: 'line', smooth: true, data: trend.data.scores,
+               areaStyle: {} }]
+  })
+
+  // 交易排行榜（来自 Redis ZSet）
+  const rank = await getTraderRank()
+  echarts.init(rankRef.value).setOption({
+    title: { text: '校园交易达人 Top10' },
+    xAxis: { type: 'value' },
+    yAxis: { type: 'category', data: rank.data.names.reverse() },
+    series: [{ type: 'bar', data: rank.data.counts.reverse() }]
+  })
+})
+</script>
+
+  yaml
+  version: '3.8'
+services:
+  web:
+    build: .
+    container_name: campus-trade-web
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/campus_trade?useUnicode=true&characterEncoding=utf8
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root123
+      SPRING_REDIS_HOST: redis
+    networks: [campus]
+
+  frontend:
+    build: ./frontend
+    container_name: campus-trade-front
+    networks: [campus]
+
+  mysql:
+    image: mysql:8.0
+    container_name: campus-trade-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: campus_trade
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - mysql_data:/var/lib/mysql
+    networks: [campus]
+
+  redis:
+    image: redis:7-alpine
+    container_name: campus-trade-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks: [campus]
+
+  nginx:
+    image: nginx:alpine
+    container_name: campus-trade-nginx
+    ports: ["80:80"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./frontend/dist:/usr/share/nginx/html
+    depends_on: [web, frontend]
+    networks: [campus]
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  campus:
+
+nginx
+  worker_processes auto;
+events { worker_connections 1024; }
+
+http {
+  include mime.types;
+  gzip on;
+  gzip_types text/css application/javascript application/json image/svg+xml;
+  gzip_min_length 1k;
+  gzip_comp_level 6;
+
+  server {
+    listen 80;
+    server_name localhost;
+
+    # 前端静态资源
+    location / {
+      root /usr/share/nginx/html;
+      try_files $uri $uri/ /index.html;
+      expires 7d;
+    }
+
+    # API 反向代理
+    location /api/ {
+      proxy_pass http://web:8080/;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # WebSocket 升级
+    location /ws {
+      proxy_pass http://web:8081/ws;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_read_timeout 3600s;
+    }
+  }
+}
